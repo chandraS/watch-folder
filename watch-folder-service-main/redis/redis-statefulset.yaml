@@ -1,0 +1,223 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: object-monitor
+  labels:
+    app: redis
+spec:
+  ports:
+  - port: 6379
+    name: redis
+  clusterIP: None  # Headless service for StatefulSet
+  selector:
+    app: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: object-monitor
+  labels:
+    app: redis
+spec:
+  ports:
+  - port: 26379
+    name: sentinel
+  selector:
+    app: redis
+root@localhost:~/lke-obj-notification/k8# cat redis-statefulset.yaml 
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: object-monitor
+spec:
+  serviceName: "redis"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+    spec:
+      initContainers:
+      - name: wait-for-dns
+        image: busybox:1.36
+        command: ['/bin/sh', '-c']
+        args:
+          - |
+            set -x
+            if [ "$(hostname)" = "redis-0" ]; then
+              echo "This is redis-0, no need to wait"
+              exit 0
+            fi
+
+            FQDN="redis-0.redis.object-monitor.svc.cluster.local"
+            echo "Waiting for $FQDN to be reachable..."
+            until nc -z $FQDN 6379; do
+              echo "Cannot connect to $FQDN:6379, retrying in 5s..."
+              sleep 5
+            done
+            echo "$FQDN is reachable, continuing"
+
+      - name: init-redis
+        image: redis:7.0-alpine
+        command: ['/bin/sh', '-c']
+        args:
+          - |
+            set -ex
+            cp /mnt/config/redis.conf /etc/redis/redis.conf
+            
+            # Configure Redis replication (replicas only)
+            if [ "$(hostname)" != "redis-0" ]; then
+              echo "replicaof redis-0.redis.object-monitor.svc.cluster.local 6379" >> /etc/redis/redis.conf
+            fi
+            
+            # Copy base sentinel config
+            cp /mnt/config/sentinel.conf /etc/redis/sentinel.conf
+            
+            # Get our own IP
+            MY_IP=$(hostname -i)
+            
+            # For redis-0, monitor itself by IP
+            if [ "$(hostname)" = "redis-0" ]; then
+              echo "sentinel monitor mymaster $MY_IP 6379 2" >> /etc/redis/sentinel.conf
+              echo "Master IP is $MY_IP (self)"
+            else
+              # For other pods, try to resolve redis-0's IP using FQDN
+              COUNTER=0
+              MASTER_IP=""
+              
+              while [ -z "$MASTER_IP" ] && [ $COUNTER -lt 10 ]; do
+                # Try getent with FQDN
+                MASTER_IP=$(getent hosts redis-0.redis.object-monitor.svc.cluster.local | awk '{print $1}')
+                
+                if [ -z "$MASTER_IP" ]; then
+                  echo "Waiting for DNS resolution, attempt $COUNTER..."
+                  sleep 3
+                  COUNTER=$((COUNTER+1))
+                fi
+              done
+              
+              if [ -z "$MASTER_IP" ]; then
+                echo "WARNING: Could not resolve master IP, using FQDN directly"
+                echo "sentinel monitor mymaster redis-0.redis.object-monitor.svc.cluster.local 6379 2" >> /etc/redis/sentinel.conf
+              else
+                echo "Using master IP: $MASTER_IP"
+                echo "sentinel monitor mymaster $MASTER_IP 6379 2" >> /etc/redis/sentinel.conf
+              fi
+            fi
+            
+            # Always add announce config
+            echo "sentinel announce-ip $MY_IP" >> /etc/redis/sentinel.conf
+            echo "sentinel announce-port 26379" >> /etc/redis/sentinel.conf
+
+        volumeMounts:
+        - name: redis-config
+          mountPath: /mnt/config
+        - name: config
+          mountPath: /etc/redis
+
+      containers:
+      - name: redis
+        image: redis:7.0-alpine
+        command: ["redis-server", "/etc/redis/redis.conf"]
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        ports:
+        - containerPort: 6379
+          name: redis
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        - name: config
+          mountPath: /etc/redis
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+          periodSeconds: 5
+
+      - name: sentinel
+        image: redis:7.0-alpine
+        command: ["redis-server", "/etc/redis/sentinel.conf", "--sentinel"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "200m"
+            memory: "512Mi"
+        ports:
+        - containerPort: 26379
+          name: sentinel
+        volumeMounts:
+        - name: config
+          mountPath: /etc/redis
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          periodSeconds: 10
+        startupProbe:
+          exec:
+            command:
+            - redis-cli
+            - -p
+            - "26379"
+            - ping
+          failureThreshold: 30
+          periodSeconds: 10
+
+      volumes:
+      - name: redis-config
+        configMap:
+          name: redis-config
+      - name: config
+        emptyDir: {}
+
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi

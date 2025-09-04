@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment 
+metadata:
+  name: token-auth-pod
+  namespace: monitoring
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: token-auth
+  template:
+    metadata:
+      labels:
+        app: token-auth
+    spec:
+      containers:
+      - name: token-auth-container
+        image: nathanles/micro-rest-auth:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+          - containerPort: 5000 
+        env:
+        - name: API_USER
+          valueFrom:
+            secretKeyRef:
+              name: token-auth-secret
+              key: API_USER
+        - name: API_PASS
+          valueFrom:
+            secretKeyRef:
+              name: token-auth-secret
+              key: API_PASS
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: token-auth-secret
+              key: SECRET_KEY
+        - name: AUTH_LIFETIME
+          valueFrom:
+            secretKeyRef:
+              name: token-auth-secret
+              key: AUTH_LIFETIME
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-auth-service
+  namespace: monitoring  
+spec:
+  type: ClusterIP 
+  selector:
+    app: token-auth 
+  ports:
+    - name: token-auth
+      port: 5000   
+      targetPort: 5000

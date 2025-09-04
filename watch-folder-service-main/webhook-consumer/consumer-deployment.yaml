@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-consumer
+  namespace: object-monitor
+  labels:
+    app: webhook-consumer
+spec:
+  replicas: 2  # Start with 2 replicas
+  selector:
+    matchLabels:
+      app: webhook-consumer
+  template:
+    metadata:
+      labels:
+        app: webhook-consumer
+      annotations:
+        # Added annotation for Promtail to discover
+        promtail.io/scrape: "true"
+        promtail.io/app: "webhook-consumer"
+    spec:
+      containers:
+      - name: webhook-consumer
+        image: shicha/bucket-consumer:update-config-auth-webhook-auth-logging-v1  # Updated image tag
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        env:
+        - name: INFISICAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: infisical-credentials
+              key: token
+        - name: INFISICAL_PROJECT_ID
+          valueFrom:
+            secretKeyRef:
+              name: infisical-credentials
+              key: project-id
+        - name: REDIS_HOST
+          value: "redis"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: INFISICAL_API_URL
+          value: "https://hmsinfvault.akamai-mco.com"
+        - name: INFISICAL_ENV
+          value: "dev"
+        - name: LOG_FORMAT_JSON
+          value: "true"  # Enabled JSON formatting
+        - name: LOG_FILE
+          value: "/app/logs/consumer.log"  # Added log file path
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: secrets-volume
+          mountPath: /app/secrets
+        - name: logs-volume  # mounted log volume 
+          mountPath: /app/logs
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          
+      # Added log collection sidecar
+      - name: log-collector
+        image: grafana/promtail:2.8.2
+        args:
+        - -config.file=/etc/promtail/config.yaml
+        - -log.level=info
+        volumeMounts:
+        - name: logs-volume
+          mountPath: /logs
+        - name: promtail-config
+          mountPath: /etc/promtail
+        resources:
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+            
+      volumes:
+      - name: config-volume
+        configMap:
+          name: monitor-config
+      - name: secrets-volume
+        secret:
+          secretName: bucket-secrets
+      - name: logs-volume  # logs volume
+        emptyDir: {}
+      - name: promtail-config
+        configMap:
+          name: consumer-promtail-config
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webhook-consumer-hpa
+  namespace: object-monitor
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webhook-consumer
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
